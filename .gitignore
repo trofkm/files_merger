@@ -1,0 +1,6 @@
+# binaries
+files_merger
+
+# IDE
+.idea
+.vscode
