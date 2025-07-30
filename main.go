@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
 )
 
 var (
-	extensions    = flag.String("extensions", "go", "file extensions to be parsed comma separated")
+	extensions    = flag.String("extensions", "go", "file extensions to be parsed comma separated(without dots)")
 	output        = flag.String("output", "output.txt", "output file name")
 	ignore        = flag.String("ignore", ".git,.idea", "ignore dirs with these names comma separated")
 	commentSymbol = flag.String("comment", "//", "comment symbol which used to write file name")
+	ignoreRegExp  = flag.String("ignore-reg-exp", "\\b\\B", "regexp to ignore filenames matching this regexp")
 
 	Usage = func() {
 		fmt.Printf("%s - utility to merge files with their names and contents\n", os.Args[0])
@@ -27,31 +29,39 @@ var (
 // cache to prevent scanning the same file (it is possible if user pass multiple dirs and their paths somehow intersect)
 var pathCache = make(map[string]bool)
 
+const errStr = "Error: %s\n"
+
 func main() {
 	flag.Usage = Usage
 	flag.Parse()
 
-	paths := flag.Args()
-	if len(paths) == 0 {
-		fmt.Printf("No paths provided\n")
+	if err := run(); err != nil {
+		fmt.Printf(errStr, err)
 		Usage()
 		os.Exit(1)
+	}
+	fmt.Println("saved to " + *output)
+}
+
+func run() error {
+	paths := flag.Args()
+	if len(paths) == 0 {
+		return fmt.Errorf("paths must be provided")
 	}
 
 	exts, err := prepareExtensions(*extensions)
 	if err != nil {
-		return
+		return err
 	}
 
 	ignDirs, err := prepareIgnoredDirs(*ignore)
 	if err != nil {
-		return
+		return err
 	}
 
 	file, err := os.OpenFile(*output, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("Could not create output file: %s", err)
-		os.Exit(1)
+		return fmt.Errorf("could not create output file: %s", err)
 	}
 	defer func(file *os.File) {
 		err := file.Close()
@@ -75,17 +85,24 @@ func main() {
 	wg := errgroup.Group{}
 	wg.Go(receiveAndWrite)
 
+	reg, err := regexp.Compile(*ignoreRegExp)
+	if err != nil {
+		return err
+	}
+
 	for _, path := range paths {
-		if err := parse(path, exts, ignDirs, *commentSymbol, outputCh); err != nil {
-			fmt.Printf("Error: %s\n", err)
+		if err := parse(path, exts, ignDirs, reg, *commentSymbol, outputCh); err != nil {
+			// it's okay, we just print this error and continue
+			fmt.Printf(errStr, err)
 		}
 	}
 
 	close(outputCh)
 
 	if err := wg.Wait(); err != nil {
-		fmt.Printf("Error: %s\n", err)
+		return err
 	}
+	return nil
 }
 
 // prepareExtensions trim spaces and add '.' to the extensions
@@ -130,7 +147,7 @@ func checkExt(name string, allowedExts []string) bool {
 	}
 	return false
 }
-func isIgnoredDir(path string, dirEntry os.DirEntry, ignoredDirs []string) bool {
+func isIgnoredDir(dirEntry os.DirEntry, ignoredDirs []string) bool {
 	if !dirEntry.IsDir() {
 		return false
 	}
@@ -144,46 +161,58 @@ func isIgnoredDir(path string, dirEntry os.DirEntry, ignoredDirs []string) bool 
 }
 
 // parse all files in the path with the given extensions and write their contents to the output channel
-func parse(path string, extensions []string, ignoredDirs []string, commentSymbol string, output chan<- []byte) error {
+func parse(path string, extensions []string, ignoredDirs []string, ignoreFilenameRegex *regexp.Regexp, commentSymbol string, output chan<- []byte) error {
 	buf := bytes.Buffer{}
 
 	err := filepath.WalkDir(path, func(path string, entry os.DirEntry, err error) error {
 
 		// check if entry is not in ignored dir
-		if isIgnoredDir(path, entry, ignoredDirs) {
+		if isIgnoredDir(entry, ignoredDirs) {
 			return filepath.SkipDir
 		}
 
 		if err != nil {
 			return err
 		}
-		if !entry.IsDir() && checkExt(entry.Name(), extensions) {
-			if pathCache[path] {
-				return nil
-			}
-			// file name
-			_, err := fmt.Fprintf(&buf, "%s %s\n", commentSymbol, path)
-			if err != nil {
-				return err
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			// the actual file content
-			_, err = fmt.Fprintf(&buf, "%s\n", string(data))
-			if err != nil {
-				return err
-			}
-			// TODO: I tried to do this in a separate goroutine without any additional copy,
-			//  but looks like it's not working, so bytes.Buffer looks useless here
-			btsCopy := make([]byte, len(buf.Bytes()))
-			copy(btsCopy, buf.Bytes())
-			output <- btsCopy
-			buf.Reset()
-
-			pathCache[path] = true
+		if entry.IsDir() {
+			return nil
 		}
+
+		// check if file name matches the ignore regexp
+		if ignoreFilenameRegex.MatchString(entry.Name()) {
+			return nil
+		}
+
+		if !checkExt(entry.Name(), extensions) {
+			return nil
+		}
+
+		if pathCache[path] {
+			return nil
+		}
+		// file name
+
+		if _, err = fmt.Fprintf(&buf, "%s %s\n", commentSymbol, path); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// the actual file content
+		_, err = fmt.Fprintf(&buf, "%s\n", string(data))
+		if err != nil {
+			return err
+		}
+		// TODO: I tried to do this in a separate goroutine without any additional copy,
+		//  but looks like it's not working, so bytes.Buffer looks useless here
+		btsCopy := make([]byte, len(buf.Bytes()))
+		copy(btsCopy, buf.Bytes())
+		output <- btsCopy
+		buf.Reset()
+
+		pathCache[path] = true
+
 		return nil
 	})
 
